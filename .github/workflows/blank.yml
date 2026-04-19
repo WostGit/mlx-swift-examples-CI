@@ -15,7 +15,7 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # Keep the same API key name you used before. Do not rename it.
+  # Keep the same API key env name you used before. Do not rename it.
   # Example only:
   # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
@@ -200,7 +200,6 @@ jobs:
                   arch = d.get("arch", "")
 
                   if plat == "macOS":
-                      # Use a concrete macOS destination when possible to avoid ambiguous matches.
                       if name and name not in ("Any Mac",):
                           spec = f"platform=macOS,arch={arch or 'arm64'},name={name}"
                           label = f"macOS:{name}:{arch or 'arm64'}"
@@ -422,6 +421,8 @@ jobs:
                       "failed",
                       "test failed",
                       "no such module",
+                      "must be enabled before it can be used",
+                      "skipmacrovalidation",
                       "unable to",
                       "unsupported",
                       "warning:",
@@ -518,7 +519,14 @@ jobs:
               important = []
               for line in lines:
                   low = line.lower()
-                  if " error: " in low or low.startswith("error:") or "fatal" in low or "failed" in low or "xcodebuild:" in low:
+                  if (
+                      " error: " in low
+                      or low.startswith("error:")
+                      or "fatal" in low
+                      or "failed" in low
+                      or "xcodebuild:" in low
+                      or "must be enabled before it can be used" in low
+                  ):
                       important.append(line.rstrip())
               if not important:
                   important = lines[-80:]
@@ -629,6 +637,30 @@ jobs:
               '''
           ))
 
+          # Probe for macro/plugin trust failure explicitly.
+          macro_probe_name = f"{case_id}-06a-macro-probe.log"
+          macro_probe = run_stream(
+              "macro_validation_probe",
+              [
+                  "xcodebuild",
+                  "-project", "mlx-swift-examples.xcodeproj",
+                  "-scheme", scheme,
+                  "-configuration", configuration,
+                  "-destination", destination,
+                  "-derivedDataPath", "DerivedDataMacroProbe",
+                  "CODE_SIGNING_ALLOWED=NO",
+                  "build",
+              ],
+              repo,
+              macro_probe_name,
+          )
+          results.append(macro_probe)
+
+          macro_failure_detected = any(
+              "must be enabled before it can be used" in line.lower()
+              for line in macro_probe.get("top_lines", [])
+          )
+
           resolve_packages = run_stream(
               "resolve_package_dependencies",
               [
@@ -677,19 +709,23 @@ jobs:
               '''
           ))
 
+          build_cmd = [
+              "xcodebuild",
+              "-project", "mlx-swift-examples.xcodeproj",
+              "-scheme", scheme,
+              "-configuration", configuration,
+              "-destination", destination,
+              "-derivedDataPath", "DerivedData",
+              "CODE_SIGNING_ALLOWED=NO",
+          ]
+          if macro_failure_detected:
+              build_cmd.append("-skipMacroValidation")
+          build_cmd.append("build")
+
           build1_name = f"{case_id}-08-build-attempt-1.log"
           build_attempt_1 = run_stream(
               "build_attempt_1",
-              [
-                  "xcodebuild",
-                  "-project", "mlx-swift-examples.xcodeproj",
-                  "-scheme", scheme,
-                  "-configuration", configuration,
-                  "-destination", destination,
-                  "-derivedDataPath", "DerivedData",
-                  "CODE_SIGNING_ALLOWED=NO",
-                  "build",
-              ],
+              build_cmd,
               repo,
               build1_name,
           )
@@ -735,36 +771,44 @@ jobs:
                   '''
               ))
 
+              clean_retry_cmd = [
+                  "xcodebuild",
+                  "-project", "mlx-swift-examples.xcodeproj",
+                  "-scheme", scheme,
+                  "-configuration", configuration,
+                  "-destination", destination,
+                  "-derivedDataPath", "DerivedDataRetry",
+                  "CODE_SIGNING_ALLOWED=NO",
+              ]
+              if macro_failure_detected:
+                  clean_retry_cmd.append("-skipMacroValidation")
+              clean_retry_cmd.append("clean")
+
               clean_retry = run_stream(
                   "clean_before_retry",
-                  [
-                      "xcodebuild",
-                      "-project", "mlx-swift-examples.xcodeproj",
-                      "-scheme", scheme,
-                      "-configuration", configuration,
-                      "-destination", destination,
-                      "-derivedDataPath", "DerivedDataRetry",
-                      "CODE_SIGNING_ALLOWED=NO",
-                      "clean",
-                  ],
+                  clean_retry_cmd,
                   repo,
                   f"{case_id}-11-clean-before-retry.log",
               )
               results.append(clean_retry)
 
+              build2_cmd = [
+                  "xcodebuild",
+                  "-project", "mlx-swift-examples.xcodeproj",
+                  "-scheme", scheme,
+                  "-configuration", configuration,
+                  "-destination", destination,
+                  "-derivedDataPath", "DerivedDataRetry",
+                  "CODE_SIGNING_ALLOWED=NO",
+              ]
+              if macro_failure_detected:
+                  build2_cmd.append("-skipMacroValidation")
+              build2_cmd.append("build")
+
               build2_name = f"{case_id}-12-build-attempt-2.log"
               build_attempt_2 = run_stream(
                   "build_attempt_2",
-                  [
-                      "xcodebuild",
-                      "-project", "mlx-swift-examples.xcodeproj",
-                      "-scheme", scheme,
-                      "-configuration", configuration,
-                      "-destination", destination,
-                      "-derivedDataPath", "DerivedDataRetry",
-                      "CODE_SIGNING_ALLOWED=NO",
-                      "build",
-                  ],
+                  build2_cmd,
                   repo,
                   build2_name,
               )
@@ -797,6 +841,7 @@ jobs:
               "platform": platform,
               "status": final_status,
               "failed_step": failed_step,
+              "macro_failure_detected": macro_failure_detected,
               "steps": results,
               "snapshots": snapshots,
               "final_log_excerpt": final_log_excerpt,
@@ -831,12 +876,12 @@ jobs:
           if not summaries:
               print("[SUMMARY] No case summaries were found.")
           else:
-              print("| Case | Status | Failed step | Steps | Snapshots |")
-              print("|---|---|---|---:|---:|")
+              print("| Case | Status | Failed step | Macro issue detected | Steps | Snapshots |")
+              print("|---|---|---|---|---:|---:|")
               for s in summaries:
                   data = json.loads(s.read_text(encoding="utf-8"))
                   case_name = f"{data['scheme']} | {data['configuration']} | {data['destination_label']}"
-                  print(f"| {case_name} | {data['status']} | {data.get('failed_step') or ''} | {len(data.get('steps', []))} | {len(data.get('snapshots', []))} |")
+                  print(f"| {case_name} | {data['status']} | {data.get('failed_step') or ''} | {data.get('macro_failure_detected')} | {len(data.get('steps', []))} | {len(data.get('snapshots', []))} |")
                   if data.get("status") != "passed":
                       print(f"[SUMMARY] FAILING_CASE={case_name}", flush=True)
                       for line in data.get("final_log_excerpt", [])[-40:]:
@@ -881,6 +926,8 @@ jobs:
       - iterative-builds
     runs-on: macos-15
     timeout-minutes: 30
+    env:
+      DISCOVERY_SUMMARY: ${{ needs.discover.outputs.discovery_summary }}
 
     steps:
       - name: Download all artifacts
@@ -895,6 +942,7 @@ jobs:
 
           python3 <<'PY'
           import json
+          import os
           from pathlib import Path
 
           artifacts = Path("artifacts")
@@ -913,34 +961,40 @@ jobs:
                   failed += 1
               rows.append(data)
 
-          lines = []
-          lines.append("${{ needs.discover.outputs.discovery_summary }}")
-          lines.append("")
-          lines.append("## LLM example case summaries")
-          lines.append("")
-          lines.append("| Case | Status | Failed step | Step count | Snapshot count |")
-          lines.append("|---|---|---|---:|---:|")
+          discovery_summary = os.environ.get("DISCOVERY_SUMMARY", "").strip()
+
+          summary_lines = []
+          if discovery_summary:
+              summary_lines.append(discovery_summary)
+              summary_lines.append("")
+
+          summary_lines.append("## LLM example case summaries")
+          summary_lines.append("")
+          summary_lines.append("| Case | Status | Failed step | Macro issue detected | Step count | Snapshot count |")
+          summary_lines.append("|---|---|---|---|---:|---:|")
 
           for data in rows:
               case_name = f"{data['scheme']} | {data['configuration']} | {data['destination_label']}"
               failed_step = data.get("failed_step") or ""
-              lines.append(f"| {case_name} | {data['status']} | {failed_step} | {len(data.get('steps', []))} | {len(data.get('snapshots', []))} |")
+              summary_lines.append(
+                  f"| {case_name} | {data['status']} | {failed_step} | {data.get('macro_failure_detected')} | {len(data.get('steps', []))} | {len(data.get('snapshots', []))} |"
+              )
 
-          lines.append("")
-          lines.append(f"- Passed cases: **{passed}**")
-          lines.append(f"- Failed cases: **{failed}**")
-          lines.append("")
-          lines.append("## Artifact tree")
-          lines.append("```")
+          summary_lines.append("")
+          summary_lines.append(f"- Passed cases: **{passed}**")
+          summary_lines.append(f"- Failed cases: **{failed}**")
+          summary_lines.append("")
+          summary_lines.append("## Artifact tree")
+          summary_lines.append("```")
           for p in sorted(artifacts.glob("**/*")):
               if p.is_file():
-                  lines.append(str(p))
-          lines.append("```")
+                  summary_lines.append(str(p))
+          summary_lines.append("```")
 
-          summary_text = "\n".join(lines) + "\n"
+          summary_text = "\n".join(summary_lines) + "\n"
           print(summary_text)
 
-          step_summary_path = Path("${GITHUB_STEP_SUMMARY}")
+          step_summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
           with open(step_summary_path, "a", encoding="utf-8") as f:
               f.write(summary_text)
 
@@ -953,7 +1007,7 @@ jobs:
           print("-" * 160)
           for data in rows:
               case_name = f"{data['scheme']} | {data['configuration']} | {data['destination_label']}"
-              print(f"[SUMMARY] CASE={case_name} | STATUS={data['status']} | FAILED_STEP={data.get('failed_step') or '-'}")
+              print(f"[SUMMARY] CASE={case_name} | STATUS={data['status']} | FAILED_STEP={data.get('failed_step') or '-'} | MACRO_ISSUE={data.get('macro_failure_detected')}")
               if data.get("status") != "passed":
                   for line in data.get("final_log_excerpt", [])[-40:]:
                       print(f"[SUMMARY] {line}")
