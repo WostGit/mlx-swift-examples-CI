@@ -1,0 +1,450 @@
+name: Exhaustive mlx-swift-examples CI
+
+on:
+  # Manual trigger from the Actions tab.
+  workflow_dispatch:
+
+  # Re-run when this workflow file changes on push.
+  push:
+    paths:
+      - ".github/workflows/exhaustive-mlx-swift-examples.yml"
+
+  # Also validate workflow changes in pull requests.
+  pull_request:
+    paths:
+      - ".github/workflows/exhaustive-mlx-swift-examples.yml"
+
+# Prevent overlapping runs for the same branch / PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Opt into the newer JavaScript action runtime.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  discover:
+    name: Discover schemes and destinations
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
+      NSUnbufferedIO: YES
+
+    outputs:
+      matrix_json: ${{ steps.emit.outputs.matrix_json }}
+      discovery_summary: ${{ steps.emit.outputs.discovery_summary }}
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Restore SwiftPM cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.swiftpm
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-mlx-exhaustive-discover-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-mlx-exhaustive-discover-
+            ${{ runner.os }}-mlx-exhaustive-
+
+      - name: Prepare workspace directories
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p ci/repos
+          mkdir -p ci/out
+          mkdir -p ci/logs
+
+      - name: Show toolchain and simulator inventory
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "::group::toolchain"
+          xcode-select -p
+          xcodebuild -version
+          swift --version
+          echo "::endgroup::"
+
+          echo "::group::simulator runtimes"
+          xcrun simctl list runtimes || true
+          echo "::endgroup::"
+
+          echo "::group::simulator devices"
+          xcrun simctl list devices available || true
+          echo "::endgroup::"
+
+      - name: Clone mlx-swift-examples
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            --depth 1 \
+            --branch main \
+            https://github.com/ml-explore/mlx-swift-examples.git \
+            ci/repos/mlx-swift-examples
+
+          echo "::group::repo tree"
+          ls -la ci/repos/mlx-swift-examples
+          echo "::endgroup::"
+
+      - name: Discover exhaustive scheme x destination x configuration matrix
+        id: emit
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          repo = Path("ci/repos/mlx-swift-examples")
+          out_dir = Path("ci/out")
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          def run_capture(cmd, cwd):
+              p = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+              return p.returncode, p.stdout, p.stderr
+
+          def parse_showdestinations(text):
+              entries = []
+              current_section = None
+
+              for raw in text.splitlines():
+                  line = raw.rstrip()
+
+                  if "Available destinations for the" in line:
+                      current_section = "available"
+                      continue
+
+                  if "Ineligible destinations for the" in line:
+                      current_section = "ineligible"
+                      continue
+
+                  s = line.strip()
+                  if not (s.startswith("{") and s.endswith("}")):
+                      continue
+
+                  body = s[1:-1]
+                  fields = {}
+                  for part in body.split(", "):
+                      if ":" in part:
+                          k, v = part.split(":", 1)
+                          fields[k.strip()] = v.strip()
+
+                  fields["_section"] = current_section
+                  entries.append(fields)
+
+              return entries
+
+          rc, out, err = run_capture(
+              [
+                  "xcodebuild",
+                  "-list",
+                  "-json",
+                  "-project",
+                  "mlx-swift-examples.xcodeproj",
+              ],
+              repo,
+          )
+
+          if rc != 0:
+              print(out)
+              print(err)
+              raise SystemExit(rc)
+
+          payload = json.loads(out)
+          schemes = payload.get("project", {}).get("schemes", [])
+
+          # Exclude helper / package-only style schemes if they appear.
+          excluded_exact = {
+              "mlx-swift-examples-Package",
+          }
+          excluded_prefixes = (
+              "All tests",
+          )
+
+          candidate_schemes = []
+          for scheme in schemes:
+              if scheme in excluded_exact:
+                  continue
+              if any(scheme.startswith(prefix) for prefix in excluded_prefixes):
+                  continue
+              candidate_schemes.append(scheme)
+
+          matrix_include = []
+          discovery = []
+
+          for scheme in candidate_schemes:
+              rc, d_out, d_err = run_capture(
+                  [
+                      "xcodebuild",
+                      "-project",
+                      "mlx-swift-examples.xcodeproj",
+                      "-scheme",
+                      scheme,
+                      "-showdestinations",
+                  ],
+                  repo,
+              )
+
+              combined = d_out + "\n" + d_err
+              destinations = parse_showdestinations(combined)
+
+              available = [d for d in destinations if d.get("_section") == "available"]
+              usable = []
+
+              for d in available:
+                  plat = d.get("platform", "")
+                  name = d.get("name", "")
+                  osver = d.get("OS", "latest")
+
+                  # Keep only destinations that are concrete and useful in CI.
+                  if plat == "macOS":
+                      spec = "platform=macOS"
+                      label = "macOS"
+
+                  elif plat in ("iOS Simulator", "visionOS Simulator"):
+                      if not name or name.startswith("Any "):
+                          continue
+
+                      spec = f"platform={plat},name={name}"
+                      if osver and osver != "latest":
+                          spec += f",OS={osver}"
+
+                      label = f"{plat}:{name}:{osver}"
+
+                  else:
+                      continue
+
+                  usable.append(
+                      {
+                          "platform": plat,
+                          "name": name,
+                          "os": osver,
+                          "destination": spec,
+                          "label": label,
+                      }
+                  )
+
+              # Deduplicate by exact destination string.
+              unique = []
+              seen = set()
+              for item in usable:
+                  if item["destination"] in seen:
+                      continue
+                  seen.add(item["destination"])
+                  unique.append(item)
+
+              discovery.append(
+                  {
+                      "scheme": scheme,
+                      "showdestinations_rc": rc,
+                      "usable_destinations": unique,
+                      "raw_destination_count": len(destinations),
+                  }
+              )
+
+              # Exhaustive matrix across all usable destinations and both configs.
+              for dest in unique:
+                  for configuration in ("Debug", "Release"):
+                      matrix_include.append(
+                          {
+                              "scheme": scheme,
+                              "configuration": configuration,
+                              "destination": dest["destination"],
+                              "destination_label": dest["label"],
+                              "platform": dest["platform"],
+                          }
+                      )
+
+          matrix = {"include": matrix_include}
+          manifest = {
+              "schemes": candidate_schemes,
+              "discovery": discovery,
+              "matrix_size": len(matrix_include),
+          }
+
+          (out_dir / "manifest.json").write_text(
+              json.dumps(manifest, indent=2),
+              encoding="utf-8",
+          )
+          (out_dir / "matrix.json").write_text(
+              json.dumps(matrix, indent=2),
+              encoding="utf-8",
+          )
+
+          summary_lines = []
+          summary_lines.append("# mlx-swift-examples exhaustive discovery")
+          summary_lines.append("")
+          summary_lines.append(f"- Schemes discovered: **{len(candidate_schemes)}**")
+          summary_lines.append(f"- Matrix entries: **{len(matrix_include)}**")
+          summary_lines.append("")
+          summary_lines.append("| Scheme | Usable destinations |")
+          summary_lines.append("|---|---|")
+
+          for item in discovery:
+              labels = ", ".join(x["label"] for x in item["usable_destinations"])
+              summary_lines.append(f"| {item['scheme']} | {labels} |")
+
+          summary_md = "\n".join(summary_lines) + "\n"
+          (out_dir / "discovery-summary.md").write_text(summary_md, encoding="utf-8")
+
+          print("::group::manifest.json")
+          print((out_dir / "manifest.json").read_text(encoding="utf-8"))
+          print("::endgroup::")
+
+          print("::group::matrix.json")
+          print((out_dir / "matrix.json").read_text(encoding="utf-8"))
+          print("::endgroup::")
+
+          print("::group::discovery-summary.md")
+          print(summary_md)
+          print("::endgroup::")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write("matrix_json<<EOF\n")
+              f.write((out_dir / "matrix.json").read_text(encoding="utf-8"))
+              f.write("\nEOF\n")
+
+              f.write("discovery_summary<<EOF\n")
+              f.write(summary_md)
+              f.write("\nEOF\n")
+          PY
+
+      - name: Upload discovery artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlx-discovery
+          path: ci/out
+          if-no-files-found: ignore
+
+  exhaustive-builds:
+    name: ${{ matrix.scheme }} | ${{ matrix.configuration }} | ${{ matrix.destination_label }}
+    needs: discover
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJson(needs.discover.outputs.matrix_json) }}
+
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
+      NSUnbufferedIO: YES
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Restore SwiftPM cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.swiftpm
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-mlx-exhaustive-${{ matrix.scheme }}-${{ matrix.configuration }}-${{ matrix.destination_label }}
+          restore-keys: |
+            ${{ runner.os }}-mlx-exhaustive-${{ matrix.scheme }}-
+            ${{ runner.os }}-mlx-exhaustive-
+
+      - name: Prepare workspace directories
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p ci/repos
+          mkdir -p ci/results/logs
+
+      - name: Clone mlx-swift-examples
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            --depth 1 \
+            --branch main \
+            https://github.com/ml-explore/mlx-swift-examples.git \
+            ci/repos/mlx-swift-examples
+
+      - name: Build exact combination
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd ci/repos/mlx-swift-examples
+
+          SAFE_SCHEME="$(printf '%s' "${{ matrix.scheme }}" | tr ' /:' '___')"
+          SAFE_DEST="$(printf '%s' "${{ matrix.destination_label }}" | tr ' /:,' '_____')"
+          LOG="../../results/logs/${SAFE_SCHEME}-${{ matrix.configuration }}-${SAFE_DEST}.log"
+
+          echo "::group::build combination"
+          echo "SCHEME=${{ matrix.scheme }}"
+          echo "CONFIGURATION=${{ matrix.configuration }}"
+          echo "DESTINATION=${{ matrix.destination }}"
+          echo "PROJECT=mlx-swift-examples.xcodeproj"
+          echo "WORKDIR=$(pwd)"
+          echo "::endgroup::"
+
+          echo "::group::xcodebuild output"
+          xcodebuild \
+            -project mlx-swift-examples.xcodeproj \
+            -scheme "${{ matrix.scheme }}" \
+            -configuration "${{ matrix.configuration }}" \
+            -destination "${{ matrix.destination }}" \
+            -derivedDataPath DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            build \
+            2>&1 | tee "$LOG"
+          echo "::endgroup::"
+
+      - name: Upload per-combination logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlx-${{ matrix.scheme }}-${{ matrix.configuration }}-${{ matrix.destination_label }}
+          path: ci/results
+          if-no-files-found: ignore
+
+  summary:
+    name: Summarize exhaustive results
+    if: always()
+    needs:
+      - discover
+      - exhaustive-builds
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Write final summary
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "${{ needs.discover.outputs.discovery_summary }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "## Artifact tree" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          find artifacts -maxdepth 3 -type f | sort >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::group::artifact tree"
+          find artifacts -maxdepth 4 -type f | sort
+          echo "::endgroup::"
