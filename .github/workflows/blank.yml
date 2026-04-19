@@ -15,6 +15,9 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Keep the same API key name you used before. Do not rename it.
+  # Example only:
+  # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
 jobs:
   discover:
@@ -24,6 +27,8 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
       NSUnbufferedIO: YES
+      # Keep the same API key env name here too if you already had it.
+      # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     outputs:
       matrix_json: ${{ steps.emit.outputs.matrix_json }}
       discovery_summary: ${{ steps.emit.outputs.discovery_summary }}
@@ -49,19 +54,28 @@ jobs:
           set -euxo pipefail
           mkdir -p ci/repos ci/out ci/logs
 
-      - name: Show runner and toolchain context
+      - name: Show runner, toolchain, environment, and simulator inventory
         shell: bash
         run: |
           set -euxo pipefail
 
-          echo "::group::runner and toolchain"
+          echo "::group::runner and system context"
           date
           uname -a
           sw_vers
+          id
+          pwd
+          whoami
+          env | sort
+          echo "::endgroup::"
+
+          echo "::group::developer tools"
           xcode-select -p
           xcodebuild -version
           swift --version
-          env | sort
+          clang --version || true
+          xcrun --find xcodebuild
+          xcrun --find swift
           echo "::endgroup::"
 
           echo "::group::simulator runtimes"
@@ -72,6 +86,10 @@ jobs:
           xcrun simctl list devices available || true
           echo "::endgroup::"
 
+          echo "::group::simulator device types"
+          xcrun simctl list devicetypes || true
+          echo "::endgroup::"
+
       - name: Clone mlx-swift-examples
         shell: bash
         run: |
@@ -79,12 +97,16 @@ jobs:
 
           git clone --depth 1 --branch main https://github.com/ml-explore/mlx-swift-examples.git ci/repos/mlx-swift-examples
 
-          echo "::group::repo tree"
+          echo "::group::repo metadata"
           cd ci/repos/mlx-swift-examples
           pwd
           git rev-parse HEAD
           git status --short --branch
-          find . -maxdepth 3 | sort
+          git log --oneline -n 10
+          echo "::endgroup::"
+
+          echo "::group::repo tree"
+          find . -maxdepth 4 | sort
           echo "::endgroup::"
 
       - name: Discover only LLM example schemes and usable destinations
@@ -103,7 +125,6 @@ jobs:
           out_dir = Path("ci/out")
           out_dir.mkdir(parents=True, exist_ok=True)
 
-          # Focus only on known LLM example schemes.
           TARGET_SCHEMES = [
               "LLMBasic",
               "LLMEval",
@@ -176,11 +197,16 @@ jobs:
                   plat = d.get("platform", "")
                   name = d.get("name", "")
                   osver = d.get("OS", "latest")
+                  arch = d.get("arch", "")
 
-                  # Keep only concrete, likely-useful build destinations.
                   if plat == "macOS":
-                      spec = "platform=macOS"
-                      label = "macOS"
+                      # Use a concrete macOS destination when possible to avoid ambiguous matches.
+                      if name and name not in ("Any Mac",):
+                          spec = f"platform=macOS,arch={arch or 'arm64'},name={name}"
+                          label = f"macOS:{name}:{arch or 'arm64'}"
+                      else:
+                          spec = "platform=macOS,arch=arm64,name=My Mac"
+                          label = "macOS:My Mac:arm64"
                   elif plat in ("iOS Simulator", "visionOS Simulator"):
                       if not name or name.startswith("Any "):
                           continue
@@ -313,6 +339,8 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
       NSUnbufferedIO: YES
+      # Keep the same API key env name as before here too if this job previously used it.
+      # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
     steps:
       - name: Checkout workflow repository
@@ -383,7 +411,7 @@ jobs:
           def log(prefix, message):
               print(f"[{prefix}] {message}", flush=True)
 
-          def top_lines(text, limit=25):
+          def top_lines(text, limit=40):
               hits = []
               for raw in text.splitlines():
                   s = raw.rstrip()
@@ -405,6 +433,9 @@ jobs:
                       "swift package",
                       "compile",
                       "link",
+                      "library not loaded",
+                      "command line invocation",
+                      "build settings from command line",
                   ]):
                       hits.append(s)
               return hits[:limit]
@@ -479,6 +510,24 @@ jobs:
                   print(result.stderr, flush=True)
               return str(snapshot_path)
 
+          def summarize_build_log_tail(log_file, label):
+              path = logs_dir / log_file
+              if not path.exists():
+                  return []
+              lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+              important = []
+              for line in lines:
+                  low = line.lower()
+                  if " error: " in low or low.startswith("error:") or "fatal" in low or "failed" in low or "xcodebuild:" in low:
+                      important.append(line.rstrip())
+              if not important:
+                  important = lines[-80:]
+              print(f"[SUMMARY] important tail for {label} begin", flush=True)
+              for line in important[-80:]:
+                  print(f"[SUMMARY] {line}", flush=True)
+              print(f"[SUMMARY] important tail for {label} end", flush=True)
+              return important[-80:]
+
           banner(f"START CASE :: {scheme} :: {configuration} :: {destination_label}")
           log("CASE", "PROJECT=mlx-swift-examples.xcodeproj")
           log("CASE", f"SCHEME={scheme}")
@@ -536,6 +585,7 @@ jobs:
                   "failed_step": "repo_layout_check",
                   "steps": results,
                   "snapshots": snapshots,
+                  "final_log_excerpt": [],
               }
               (results_dir / f"{case_id}-summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
               raise SystemExit(1)
@@ -575,7 +625,7 @@ jobs:
               "05b-build-settings-key-grep",
               f'''
               set -euxo pipefail
-              xcodebuild -project mlx-swift-examples.xcodeproj -scheme "{scheme}" -configuration "{configuration}" -destination "{destination}" -showBuildSettings | grep -E "PRODUCT_NAME|SDKROOT|SUPPORTED_PLATFORMS|PLATFORM_NAME|TARGET_BUILD_DIR|BUILT_PRODUCTS_DIR|SWIFT_VERSION|ARCHS|CODE_SIGNING_ALLOWED|CODE_SIGNING_REQUIRED" || true
+              xcodebuild -project mlx-swift-examples.xcodeproj -scheme "{scheme}" -configuration "{configuration}" -destination "{destination}" -showBuildSettings | grep -E "PRODUCT_NAME|SDKROOT|SUPPORTED_PLATFORMS|PLATFORM_NAME|TARGET_BUILD_DIR|BUILT_PRODUCTS_DIR|SWIFT_VERSION|ARCHS|CODE_SIGNING_ALLOWED|CODE_SIGNING_REQUIRED|PRODUCT_BUNDLE_IDENTIFIER|ENABLE_TESTABILITY|SWIFT_OPTIMIZATION_LEVEL" || true
               '''
           ))
 
@@ -597,7 +647,7 @@ jobs:
               "06b-package-state",
               r'''
               set -euxo pipefail
-              find . -maxdepth 3 \( -name Package.resolved -o -name Package.swift \) | sort
+              find . -maxdepth 4 \( -name Package.resolved -o -name Package.swift \) | sort
               find ~/Library/Developer/Xcode/DerivedData -maxdepth 2 -type d | head -n 50 || true
               '''
           ))
@@ -623,10 +673,11 @@ jobs:
               "07b-deriveddata-before-build",
               r'''
               set -euxo pipefail
-              find DerivedData -maxdepth 4 | sort || true
+              find DerivedData -maxdepth 3 | sort || true
               '''
           ))
 
+          build1_name = f"{case_id}-08-build-attempt-1.log"
           build_attempt_1 = run_stream(
               "build_attempt_1",
               [
@@ -640,7 +691,7 @@ jobs:
                   "build",
               ],
               repo,
-              f"{case_id}-08-build-attempt-1.log",
+              build1_name,
           )
           results.append(build_attempt_1)
 
@@ -648,13 +699,14 @@ jobs:
               "08b-deriveddata-after-build-attempt-1",
               r'''
               set -euxo pipefail
-              find DerivedData -maxdepth 5 | sort || true
+              find DerivedData -maxdepth 4 | sort || true
               find DerivedData -type f \( -name "*.xcresult" -o -name "*.log" -o -name "*.txt" \) | sort || true
               '''
           ))
 
           final_status = "passed"
           failed_step = None
+          final_log_excerpt = summarize_build_log_tail(build1_name, "build_attempt_1")
 
           if build_attempt_1["rc"] != 0:
               log("CHECKPOINT", "first build attempt failed, collecting additional diagnostics")
@@ -663,7 +715,7 @@ jobs:
                   "09-failure-diagnostics",
                   f'''
                   set -euxo pipefail
-                  xcodebuild -project mlx-swift-examples.xcodeproj -scheme "{scheme}" -configuration "{configuration}" -destination "{destination}" -showBuildSettings | tail -n 200 || true
+                  xcodebuild -project mlx-swift-examples.xcodeproj -scheme "{scheme}" -configuration "{configuration}" -destination "{destination}" -showBuildSettings | tail -n 300 || true
                   '''
               ))
 
@@ -672,6 +724,14 @@ jobs:
                   r'''
                   set -euxo pipefail
                   find /var/folders -type d -name "*.xcresult" 2>/dev/null | tail -n 20 || true
+                  '''
+              ))
+
+              snapshots.append(write_snapshot(
+                  "10b-build-products-search",
+                  r'''
+                  set -euxo pipefail
+                  find DerivedData -maxdepth 6 -type f | sort | tail -n 300 || true
                   '''
               ))
 
@@ -692,6 +752,7 @@ jobs:
               )
               results.append(clean_retry)
 
+              build2_name = f"{case_id}-12-build-attempt-2.log"
               build_attempt_2 = run_stream(
                   "build_attempt_2",
                   [
@@ -705,7 +766,7 @@ jobs:
                       "build",
                   ],
                   repo,
-                  f"{case_id}-12-build-attempt-2.log",
+                  build2_name,
               )
               results.append(build_attempt_2)
 
@@ -713,10 +774,12 @@ jobs:
                   "12b-deriveddata-after-build-attempt-2",
                   r'''
                   set -euxo pipefail
-                  find DerivedDataRetry -maxdepth 5 | sort || true
+                  find DerivedDataRetry -maxdepth 4 | sort || true
                   find DerivedDataRetry -type f \( -name "*.xcresult" -o -name "*.log" -o -name "*.txt" \) | sort || true
                   '''
               ))
+
+              final_log_excerpt = summarize_build_log_tail(build2_name, "build_attempt_2")
 
               if build_attempt_2["rc"] != 0:
                   final_status = "failed"
@@ -736,6 +799,7 @@ jobs:
               "failed_step": failed_step,
               "steps": results,
               "snapshots": snapshots,
+              "final_log_excerpt": final_log_excerpt,
           }
 
           summary_path = results_dir / f"{case_id}-summary.json"
@@ -760,9 +824,9 @@ jobs:
           results = Path("ci/results")
           summaries = sorted(results.glob("*-summary.json"))
 
-          print("=" * 120)
+          print("=" * 140)
           print("FINAL CASE SUMMARY BLOCK")
-          print("=" * 120)
+          print("=" * 140)
 
           if not summaries:
               print("[SUMMARY] No case summaries were found.")
@@ -773,8 +837,12 @@ jobs:
                   data = json.loads(s.read_text(encoding="utf-8"))
                   case_name = f"{data['scheme']} | {data['configuration']} | {data['destination_label']}"
                   print(f"| {case_name} | {data['status']} | {data.get('failed_step') or ''} | {len(data.get('steps', []))} | {len(data.get('snapshots', []))} |")
+                  if data.get("status") != "passed":
+                      print(f"[SUMMARY] FAILING_CASE={case_name}", flush=True)
+                      for line in data.get("final_log_excerpt", [])[-40:]:
+                          print(f"[SUMMARY] {line}", flush=True)
 
-          print("=" * 120)
+          print("=" * 140)
           PY
 
           echo "::group::case result tree"
@@ -792,7 +860,7 @@ jobs:
           echo "::group::tail of all logs"
           find ci/results/logs -type f | sort | while read -r f; do
             echo "===== LOG FILE: $f ====="
-            tail -n 120 "$f" || true
+            tail -n 200 "$f" || true
             echo
           done
           echo "::endgroup::"
@@ -820,7 +888,7 @@ jobs:
         with:
           path: artifacts
 
-      - name: Build final summary and print console block
+      - name: Build final summary and print one global console block
         shell: bash
         run: |
           set -euxo pipefail
@@ -830,59 +898,67 @@ jobs:
           from pathlib import Path
 
           artifacts = Path("artifacts")
-          summary_lines = []
-
-          summary_lines.append("${{ needs.discover.outputs.discovery_summary }}")
-          summary_lines.append("")
-          summary_lines.append("## LLM example case summaries")
-          summary_lines.append("")
-          summary_lines.append("| Case | Status | Failed step | Step count | Snapshot count |")
-          summary_lines.append("|---|---|---|---:|---:|")
-
           summary_files = sorted(artifacts.glob("**/*-summary.json"))
+
           passed = 0
           failed = 0
+          rows = []
 
           for path in summary_files:
               data = json.loads(path.read_text(encoding="utf-8"))
-              case_name = f"{data['scheme']} | {data['configuration']} | {data['destination_label']}"
-              status = data["status"]
-              failed_step = data.get("failed_step") or ""
-              step_count = len(data.get("steps", []))
-              snapshot_count = len(data.get("snapshots", []))
+              status = data.get("status", "unknown")
               if status == "passed":
                   passed += 1
               else:
                   failed += 1
-              summary_lines.append(f"| {case_name} | {status} | {failed_step} | {step_count} | {snapshot_count} |")
+              rows.append(data)
 
-          summary_lines.append("")
-          summary_lines.append(f"- Passed cases: **{passed}**")
-          summary_lines.append(f"- Failed cases: **{failed}**")
-          summary_lines.append("")
-          summary_lines.append("## Artifact tree")
-          summary_lines.append("```")
+          lines = []
+          lines.append("${{ needs.discover.outputs.discovery_summary }}")
+          lines.append("")
+          lines.append("## LLM example case summaries")
+          lines.append("")
+          lines.append("| Case | Status | Failed step | Step count | Snapshot count |")
+          lines.append("|---|---|---|---:|---:|")
+
+          for data in rows:
+              case_name = f"{data['scheme']} | {data['configuration']} | {data['destination_label']}"
+              failed_step = data.get("failed_step") or ""
+              lines.append(f"| {case_name} | {data['status']} | {failed_step} | {len(data.get('steps', []))} | {len(data.get('snapshots', []))} |")
+
+          lines.append("")
+          lines.append(f"- Passed cases: **{passed}**")
+          lines.append(f"- Failed cases: **{failed}**")
+          lines.append("")
+          lines.append("## Artifact tree")
+          lines.append("```")
           for p in sorted(artifacts.glob("**/*")):
               if p.is_file():
-                  summary_lines.append(str(p))
-          summary_lines.append("```")
+                  lines.append(str(p))
+          lines.append("```")
 
-          summary_text = "\n".join(summary_lines) + "\n"
+          summary_text = "\n".join(lines) + "\n"
           print(summary_text)
 
           step_summary_path = Path("${GITHUB_STEP_SUMMARY}")
           with open(step_summary_path, "a", encoding="utf-8") as f:
               f.write(summary_text)
 
-          print("=" * 120)
+          print("=" * 160)
           print("GLOBAL FINAL SUMMARY BLOCK")
-          print("=" * 120)
-          print(f"[SUMMARY] Passed cases: {passed}")
-          print(f"[SUMMARY] Failed cases: {failed}")
-          for path in summary_files:
-              data = json.loads(path.read_text(encoding="utf-8"))
-              print(f"[SUMMARY] CASE={data['scheme']} | {data['configuration']} | {data['destination_label']} | STATUS={data['status']} | FAILED_STEP={data.get('failed_step') or '-'}")
-          print("=" * 120)
+          print("=" * 160)
+          print(f"[SUMMARY] TOTAL_CASES={len(rows)}")
+          print(f"[SUMMARY] PASSED={passed}")
+          print(f"[SUMMARY] FAILED={failed}")
+          print("-" * 160)
+          for data in rows:
+              case_name = f"{data['scheme']} | {data['configuration']} | {data['destination_label']}"
+              print(f"[SUMMARY] CASE={case_name} | STATUS={data['status']} | FAILED_STEP={data.get('failed_step') or '-'}")
+              if data.get("status") != "passed":
+                  for line in data.get("final_log_excerpt", [])[-40:]:
+                      print(f"[SUMMARY] {line}")
+                  print("-" * 160)
+          print("=" * 160)
           PY
 
           echo "::group::artifact tree"
